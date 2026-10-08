@@ -43,20 +43,20 @@
 <rect x="404" y="48.2" width="5" height="71.5" rx="2.5" fill="#3fb950"/>
 <rect x="413" y="56.3" width="5" height="55.5" rx="2.5" fill="#3fb950"/>
 <rect x="422" y="68.1" width="5" height="31.9" rx="2.5" fill="#3fb950"/>
-<path d="M453 84h40m-9-7 9 7-9 7" stroke="#484f58" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M453 84h40m-9-7 9 7-9 7" stroke="#8b949e" stroke-opacity=".47" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 <circle cx="529" cy="32" r="5" fill="#4493f8"/>
-<rect x="545" y="28" width="38" height="8" rx="4" fill="#484f58"/>
-<rect x="593" y="28" width="235" height="8" rx="4" fill="#30363d"/>
+<rect x="545" y="28" width="38" height="8" rx="4" fill="#8b949e" fill-opacity=".47"/>
+<rect x="593" y="28" width="235" height="8" rx="4" fill="#8b949e" fill-opacity=".28"/>
 <circle cx="529" cy="58" r="5" fill="#ab7df8"/>
-<rect x="545" y="54" width="38" height="8" rx="4" fill="#484f58"/>
-<rect x="593" y="54" width="165" height="8" rx="4" fill="#30363d"/>
+<rect x="545" y="54" width="38" height="8" rx="4" fill="#8b949e" fill-opacity=".47"/>
+<rect x="593" y="54" width="165" height="8" rx="4" fill="#8b949e" fill-opacity=".28"/>
 <circle cx="529" cy="84" r="5" fill="#4493f8"/>
-<rect x="545" y="80" width="38" height="8" rx="4" fill="#484f58"/>
-<rect x="593" y="80" width="201" height="8" rx="4" fill="#30363d"/>
+<rect x="545" y="80" width="38" height="8" rx="4" fill="#8b949e" fill-opacity=".47"/>
+<rect x="593" y="80" width="201" height="8" rx="4" fill="#8b949e" fill-opacity=".28"/>
 <circle cx="529" cy="110" r="5" fill="#3fb950"/>
-<rect x="545" y="106" width="38" height="8" rx="4" fill="#484f58"/>
-<rect x="593" y="106" width="252" height="8" rx="4" fill="#30363d"/>
+<rect x="545" y="106" width="38" height="8" rx="4" fill="#8b949e" fill-opacity=".47"/>
+<rect x="593" y="106" width="252" height="8" rx="4" fill="#8b949e" fill-opacity=".28"/>
 <circle cx="529" cy="136" r="5" fill="#3fb950"/>
-<rect x="545" y="132" width="38" height="8" rx="4" fill="#484f58"/>
-<rect x="593" y="132" width="124" height="8" rx="4" fill="#30363d"/>
+<rect x="545" y="132" width="38" height="8" rx="4" fill="#8b949e" fill-opacity=".47"/>
+<rect x="593" y="132" width="124" height="8" rx="4" fill="#8b949e" fill-opacity=".28"/>
 </svg>

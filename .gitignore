@@ -1,6 +1,6 @@
 meetings/
+glossary.txt
 .env
 .venv/
 __pycache__/
 .DS_Store
-.gstack/

@@ -6,16 +6,17 @@
 """Meeting audio -> Russian transcript with timestamps and speakers, via OpenRouter.
 
 The recording is cut at quiet points into ~30 min chunks (API timeouts). Per chunk:
-  words    - MAI-Transcribe-2 (best Russian WER)
+  words    - MAI-Transcribe-2 (best Russian WER), --terms go to its phrase list
   speakers - Scribe v2 diarization
 Speaker chunks overlap by 5 min; labels are linked through the words they share there.
 Each MAI word then gets the speaker by time overlap.
 
   uv run scribe.py <audio> [--name slug] [--terms "a,b"]
-  uv run scribe.py names <meeting_dir> 1=Андрей 2=Мария
+  uv run scribe.py names <meeting_dir> 2=Андрей 3=Мария
 """
-import argparse, base64, json, os, re, shutil, subprocess, sys, time
+import argparse, base64, hashlib, json, os, re, shutil, subprocess, sys, time, unicodedata
 from array import array
+from bisect import bisect_left
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -52,24 +53,23 @@ def api_key():
 
 # --- audio -------------------------------------------------------------------
 
-def duration(p):
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
-                         capture_output=True, text=True, check=True).stdout
-    return float(out)
+def scan(p):
+    """Decoded duration (container metadata can be missing or wrong) and long (5 s+) silences:
+    MAI returns 500 on audio that starts with one."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", p, "-vn", "-af", "silencedetect=noise=-35dB:d=5",
+                        "-f", "null", "-"], capture_output=True, text=True)
+    t = re.findall(r"time=(\d+):(\d+):([\d.]+)", r.stderr)
+    if r.returncode or not t:
+        sys.exit(r.stderr.strip())
+    num = lambda k: map(float, re.findall(rf"{k}: (-?[\d.]+)", r.stderr))
+    h, m, s = t[-1]
+    return int(h) * 3600 + int(m) * 60 + float(s), list(zip(num("silence_start"), num("silence_end")))
 
 
 def pcm(p, a, d, rate=16000):
     """Mono s16 PCM bytes of [a, a+d)."""
     return subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{a:.3f}", "-t", f"{d:.3f}", "-i", p,
-                           "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"], capture_output=True, check=True).stdout
-
-
-def silences(p):
-    """Long (5 s+) silences: MAI returns 500 on audio that starts with one."""
-    err = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", p, "-af", "silencedetect=noise=-35dB:d=5",
-                          "-f", "null", "-"], capture_output=True, text=True).stderr
-    return list(zip(map(float, re.findall(r"silence_start: ([\d.]+)", err)),
-                    map(float, re.findall(r"silence_end: ([\d.]+)", err))))
+                           "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"], stdout=subprocess.PIPE, check=True).stdout
 
 
 def quietest(p, t, radius=120, win=0.6):
@@ -81,12 +81,12 @@ def quietest(p, t, radius=120, win=0.6):
     return a + (energy.index(min(energy)) * n // 4 + n / 2) / 8000 if energy else t
 
 
-def plan(src, dur):
+def plan(src, dur, sil):
     """Chunks of ~CHUNK seconds cut at quiet points; a chunk never starts with a long silence."""
     cuts = [0.0]
     while dur - cuts[-1] > CHUNK * 1.2:
         cuts.append(quietest(src, cuts[-1] + CHUNK))
-    sil, spans = silences(src), []
+    spans = []
     for a, b in zip(cuts, cuts[1:] + [dur]):
         a = next((e - 0.3 for s, e in sil if s <= a + 0.5 and a + 5 < e < b), a)
         spans.append((a, b))
@@ -111,10 +111,10 @@ def transcribe(key, mp3, out, model, **extra):
         try:
             r = httpx.post(API, json=body, headers={"Authorization": f"Bearer {key}"},
                            timeout=httpx.Timeout(3600, connect=30))
-            if r.status_code == 200 and r.json().get("words"):
+            if r.status_code == 200 and "words" in (j := r.json()):  # [] is a valid answer: no speech
                 out.write_text(r.text)
-                log(f"  {out.stem}: ok in {time.time() - t0:.0f}s")
-                return r.json()
+                log(f"  {out.stem}: {len(j['words'])} words in {time.time() - t0:.0f}s")
+                return j
             msg = f"HTTP {r.status_code}: {r.text.strip()[:500]}"
             if r.status_code != 200 and r.status_code not in RETRY:
                 break
@@ -150,8 +150,8 @@ def turns_of(words):
 
 
 def link(chunks, starts):
-    """Global speaker labels. Speaker chunk i starts OVERLAP s before MAI cut starts[i]: labels of chunks
-    i-1 and i that sit on the same words there are one person (same audio, same context -> robust to
+    """Global speaker labels S1, S2, ... Speaker chunk i starts OVERLAP s before MAI cut starts[i]: labels of
+    chunks i-1 and i that sit on the same words there are one person (same audio, same context -> robust to
     room/channel drift that breaks voice-embedding linking). Unlinked labels get new ids."""
     out, n = [], 0
     for i, ws in enumerate(chunks):
@@ -180,12 +180,9 @@ def link(chunks, starts):
 
 def assign(words, turns):
     """Speaker with max time overlap (or nearest within 1 s); weak 1-2 word blips inside a turn are smoothed."""
-    j = 0
-    for w in words:
-        while j < len(turns) and turns[j][1] < w["start"] - 1:
-            j += 1
+    for w in words:  # MAI words can step back in time, so look turns up instead of keeping a running pointer
         best, score = None, -1.0
-        for t in turns[j:]:
+        for t in turns[bisect_left(turns, w["start"] - 1, key=lambda t: t[1]):]:
             if t[0] > w["end"] + 1:
                 break
             o = min(w["end"], t[1]) - max(w["start"], t[0])
@@ -209,9 +206,9 @@ def assign(words, turns):
 
 
 def utterances(words):
-    ids, utts = {}, []
-    for w in words:
-        spk = ids.setdefault(w["spk"], len(ids) + 1)
+    utts = []
+    for w in words:  # numbered by global label, so names survive re-recognizing the words
+        spk = int(w["spk"][1:]) if w["spk"] else 0
         u = utts[-1] if utts else None
         if u and u["speaker"] == spk and not (w["start"] - u["start"] > 90 and u["text"][-1:] in ".?!…"):
             u["text"] += " " + w["word"]
@@ -248,21 +245,27 @@ def run(a):
     src = Path(a.audio).expanduser().resolve()
     st = src.stat()
     date = datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime)).strftime("%Y-%m-%d")
-    d = ROOT / "meetings" / f"{date}-{a.name or re.sub(r'\W+', '-', src.stem.lower()).strip('-')}"
-    (d / "raw").mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"\W+", "-", unicodedata.normalize("NFC", src.stem).lower()).strip("-")
+    d = ROOT / "meetings" / f"{date}-{a.name or slug}"
+    mark = d / "raw" / "size"  # same folder + another file (e.g. Zoom's audio_only.m4a) must not reuse the cache
+    if mark.exists() and mark.read_text() != str(st.st_size):
+        sys.exit(f"{d.relative_to(ROOT)} already holds another recording; pass --name")
+    dur, sil = scan(str(src))
+    spans = plan(str(src), dur, sil)
     work = d / "work"
-    work.mkdir(exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    mark.parent.mkdir(exist_ok=True)
+    mark.write_text(str(st.st_size))
     glossary = ROOT / "glossary.txt"
     terms = [x.strip() for x in glossary.read_text().splitlines() if x.strip() and not x.startswith("#")] \
         if glossary.exists() else []
     terms = [x.strip() for x in (a.terms or "").split(",") if x.strip()] + terms
-    dur = duration(str(src))
-    spans = plan(str(src), dur)
     log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(ROOT)}")
 
     def job(name, mp3, model, **extra):
         out = d / "raw" / f"{name}.json"
         if out.exists():
+            log(f"  {name}: cached")
             return json.loads(out.read_text())
         return transcribe(key, mp3, out, model, **extra)
 
@@ -277,9 +280,9 @@ def run(a):
     shift = lambda ws, s: [w | {"start": w["start"] + s, "end": w["end"] + s} for w in ws if is_word(w)]
     sspans = [(max(s - OVERLAP, 0) if i else s, e) for i, (s, e) in enumerate(spans)]
     with ThreadPoolExecutor(8) as ex:
-        # cache files are named by chunk start, so a changed plan never reuses a stale response
-        wm = list(ex.map(lambda x: chunk(f"words_{x[0]:.0f}", *x), spans))
-        sm = list(ex.map(lambda x: chunk(f"speakers_{x[0]:.0f}", *x), sspans))
+        # cache files are named by chunk start and end, so a changed plan never reuses a stale response
+        wm = list(ex.map(lambda x: chunk(f"words_{x[0]:.0f}-{x[1]:.0f}", *x), spans))
+        sm = list(ex.map(lambda x: chunk(f"speakers_{x[0]:.0f}-{x[1]:.0f}", *x), sspans))
         fw = [ex.submit(job, m.stem, m, WORDS_MODEL, **w_opts) for m in wm]
         fs = [ex.submit(job, m.stem, m, SPK_MODEL, diarize=True) for m in sm]
         spk = [shift(f.result()["words"], s) for (s, _), f in zip(sspans, fs)]
@@ -293,11 +296,17 @@ def run(a):
                 words += [w for w in sw if s <= w["start"] < e]
                 engine += f" (кусок {hms(s)}-{hms(e)}: только {SPK_MODEL})"
 
-    utts = utterances(assign(words, turns_of(spk_words)))
-    t = {"source": str(src), "duration": dur, "engine": engine, "names": {}, "utterances": utts}
+    turns = turns_of(spk_words)
+    sig = hashlib.sha1(" ".join(t[2] for t in turns).encode()).hexdigest()[:12]
+    utts = utterances(assign(words, turns))
+    t = {"source": str(src), "duration": dur, "engine": engine, "speakers": sig, "names": {}, "utterances": utts}
     old = d / "transcript.json"
-    if old.exists():
-        t["names"] = json.loads(old.read_text()).get("names", {})
+    if old.exists():  # names stay valid while the speaker labels are the same
+        o = json.loads(old.read_text())
+        if o.get("speakers", sig) == sig:
+            t["names"] = o.get("names", {})
+        elif o.get("names"):
+            log("names dropped: speaker labels changed, run `names` again")
     old.write_text(json.dumps(t, ensure_ascii=False, indent=1))
     shutil.rmtree(work)
     print(render(d))
@@ -307,19 +316,24 @@ def run(a):
 def names(a):
     d = Path(a.dir)
     t = json.loads((d / "transcript.json").read_text())
-    t["names"].update(dict(p.split("=", 1) for p in a.pairs))
+    pairs = dict(p.partition("=")[::2] for p in a.pairs)
+    known = {str(u["speaker"]) for u in t["utterances"]}
+    if bad := pairs.keys() - known:
+        sys.exit(f"no such speaker(s): {', '.join(bad)}; known: {', '.join(sorted(known, key=int))}")
+    t["names"].update(pairs)
     (d / "transcript.json").write_text(json.dumps(t, ensure_ascii=False, indent=1))
     print(render(d))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "names":
-        p = argparse.ArgumentParser()
-        p.add_argument("cmd"), p.add_argument("dir"), p.add_argument("pairs", nargs="+")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    if sys.argv[1:2] == ["names"]:
+        p.add_argument("cmd", help=argparse.SUPPRESS)
+        p.add_argument("dir")
+        p.add_argument("pairs", nargs="+", metavar="N=Имя")
         names(p.parse_args())
     else:
-        p = argparse.ArgumentParser()
         p.add_argument("audio")
         p.add_argument("--name", help="slug for meetings/<date>-<slug>")
-        p.add_argument("--terms", help="comma-separated names/terms to bias recognition")
+        p.add_argument("--terms", help="comma-separated names/terms for MAI's phrase list (first 50 used)")
         run(p.parse_args())
