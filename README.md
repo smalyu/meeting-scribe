@@ -55,7 +55,7 @@ claude
 Без Claude тоже работает, просто без имён и фоллоу-апа:
 
 ```bash
-uv run scribe.py ~/Downloads/sync.m4a --speakers 4 --terms "Kubernetes,Иван Петров"
+uv run scribe.py ~/Downloads/sync.m4a --terms "Kubernetes,Иван Петров"
 uv run scribe.py names meetings/2026-10-08-sync 1=Ольга 3=Андрей
 ```
 

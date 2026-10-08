@@ -11,7 +11,7 @@ The recording is cut at quiet points into ~30 min chunks (API timeouts). Per chu
 Speaker chunks overlap by 5 min; labels are linked through the words they share there.
 Each MAI word then gets the speaker by time overlap.
 
-  uv run scribe.py <audio> [--name slug] [--speakers N] [--terms "a,b"]
+  uv run scribe.py <audio> [--name slug] [--terms "a,b"]
   uv run scribe.py names <meeting_dir> 1=Андрей 2=Мария
 """
 import argparse, base64, json, os, re, shutil, subprocess, sys, time
@@ -82,15 +82,13 @@ def quietest(p, t, radius=120, win=0.6):
 
 
 def plan(src, dur):
-    """Chunks of ~CHUNK seconds cut at quiet points; leading long silence skipped."""
+    """Chunks of ~CHUNK seconds cut at quiet points; a chunk never starts with a long silence."""
     cuts = [0.0]
     while dur - cuts[-1] > CHUNK * 1.2:
         cuts.append(quietest(src, cuts[-1] + CHUNK))
-    spans = []
+    sil, spans = silences(src), []
     for a, b in zip(cuts, cuts[1:] + [dur]):
-        for s, e in silences(src) if a == 0 else []:
-            if s <= 0.5 and e > 5:
-                a = e - 0.3
+        a = next((e - 0.3 for s, e in sil if s <= a + 0.5 and a + 5 < e < b), a)
         spans.append((a, b))
     return spans
 
@@ -123,7 +121,8 @@ def transcribe(key, mp3, out, model, **extra):
         except httpx.TransportError as e:
             msg = repr(e)
         log(f"  {out.stem}: {msg} (attempt {attempt + 1})")
-        time.sleep(15 * 2 ** attempt)
+        if attempt < 3:
+            time.sleep(15 * 2 ** attempt)
     raise RuntimeError(f"{out.stem}: {msg}")
 
 
@@ -237,7 +236,8 @@ def render(d):
             blocks.append({"start": u["start"], "who": who(u["speaker"]), "text": u["text"]})
     lines = [f"# {d.name}", "",
              f"Источник: `{t['source']}` · {hms(t['duration'])} · {t['engine']}", "",
-             "Спикеры: " + ", ".join(f"{s} ({v / 60:.0f} мин)" for s, v in talk.most_common()), ""]
+             "Спикеры: " + ", ".join(f"{s} ({v / 60:.0f} мин)" if v >= 60 else f"{s} ({v:.0f} с)"
+                                    for s, v in talk.most_common()), ""]
     lines += [f"**[{hms(b['start'])}] {b['who']}:** {b['text']}\n" for b in blocks]
     (d / "transcript.md").write_text("\n".join(lines))
     return d / "transcript.md"
@@ -246,7 +246,8 @@ def render(d):
 def run(a):
     key = api_key()
     src = Path(a.audio).expanduser().resolve()
-    date = datetime.fromtimestamp(src.stat().st_birthtime).strftime("%Y-%m-%d")
+    st = src.stat()
+    date = datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime)).strftime("%Y-%m-%d")
     d = ROOT / "meetings" / f"{date}-{a.name or re.sub(r'\W+', '-', src.stem.lower()).strip('-')}"
     (d / "raw").mkdir(parents=True, exist_ok=True)
     work = d / "work"
@@ -271,17 +272,16 @@ def run(a):
             to_mp3(pcm(str(src), s, e - s), mp3)
         return mp3
 
-    spk_opts = {"diarize": True, **({"keyterms": terms[:1000]} if terms else {})}
-    if a.speakers:
-        spk_opts["provider"] = {"options": {"elevenlabs": {"num_speakers": a.speakers}}}
-    w_opts = {"keyterms": terms[:50]} if terms else {}
+    # OpenRouter rejects `keyterms` for both models; MAI takes a phrase list via Azure passthrough
+    w_opts = {"provider": {"options": {"azure": {"phraseList": {"phrases": terms[:50]}}}}} if terms else {}
     shift = lambda ws, s: [w | {"start": w["start"] + s, "end": w["end"] + s} for w in ws if is_word(w)]
     sspans = [(max(s - OVERLAP, 0) if i else s, e) for i, (s, e) in enumerate(spans)]
     with ThreadPoolExecutor(8) as ex:
-        wm = list(ex.map(lambda x: chunk(f"words_{x[0]}", *x[1]), enumerate(spans)))
-        sm = list(ex.map(lambda x: chunk(f"speakers_{x[0]}", *x[1]), enumerate(sspans)))
-        fw = [ex.submit(job, f"words_{i}", m, WORDS_MODEL, **w_opts) for i, m in enumerate(wm)]
-        fs = [ex.submit(job, f"speakers_{i}", m, SPK_MODEL, **spk_opts) for i, m in enumerate(sm)]
+        # cache files are named by chunk start, so a changed plan never reuses a stale response
+        wm = list(ex.map(lambda x: chunk(f"words_{x[0]:.0f}", *x), spans))
+        sm = list(ex.map(lambda x: chunk(f"speakers_{x[0]:.0f}", *x), sspans))
+        fw = [ex.submit(job, m.stem, m, WORDS_MODEL, **w_opts) for m in wm]
+        fs = [ex.submit(job, m.stem, m, SPK_MODEL, diarize=True) for m in sm]
         spk = [shift(f.result()["words"], s) for (s, _), f in zip(sspans, fs)]
         spk_words = link(spk, [s for s, _ in spans])
         words, engine = [], f"слова: {WORDS_MODEL}, спикеры: {SPK_MODEL}"
@@ -321,6 +321,5 @@ if __name__ == "__main__":
         p = argparse.ArgumentParser()
         p.add_argument("audio")
         p.add_argument("--name", help="slug for meetings/<date>-<slug>")
-        p.add_argument("--speakers", type=int, help="max number of speakers")
         p.add_argument("--terms", help="comma-separated names/terms to bias recognition")
         run(p.parse_args())
