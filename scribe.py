@@ -9,15 +9,16 @@ The recording is cut at quiet points into ~30 min chunks (API timeouts). Per chu
   words    - MAI-Transcribe-2 (best Russian WER), --terms and glossary.txt go to its phrase list
   speakers - Scribe v2 diarization
 Speaker chunks overlap by 5 min; labels are linked through the words they share there.
-Each MAI word then gets the speaker by time overlap.
+Each MAI word then gets the speaker by time overlap. A Zoom Audio Recorder file also carries who
+Zoom highlighted as speaking and where the user's own voice is: then those name the speakers.
 
   uv run scribe.py <audio> [--name slug] [--terms "a,b"]
   uv run scribe.py names <meeting_dir> 2=Андрей 3=Мария
 """
 import argparse, base64, hashlib, json, os, re, shutil, subprocess, sys, time, unicodedata
 from array import array
-from bisect import bisect_left
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from itertools import groupby
@@ -32,6 +33,7 @@ SPK_MODEL = "elevenlabs/scribe-v2"
 CHUNK = 30 * 60  # seconds per request; whole 2.7 h file -> 524 timeout
 OVERLAP = 5 * 60  # speaker chunks overlap the previous one by this much (for linking labels)
 RETRY = {408, 429, 500, 502, 503, 504, 524, 529}
+LAG = 0.7  # Zoom moves its speaker highlight about this long after a new voice (estimate, to be measured)
 
 
 def log(*a):
@@ -206,6 +208,89 @@ def assign(words, turns):
     return words
 
 
+def zoom_timeline(p):
+    """Zoom Audio Recorder's timeline in the file's description tag: (seconds, name) whenever Zoom highlighted
+    another speaker (name None: its meeting window was not visible), and [start, end] spans of the user's own
+    voice, found by their microphone. None for other files."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags=description", "-of", "json", p],
+                           capture_output=True, text=True, errors="replace")
+        t = json.loads(json.loads(r.stdout)["format"]["tags"]["description"])
+        changes = sorted(((float(s), str(n) if n else None) for s, n in t["speakers"]), key=lambda c: c[0])
+        me = []
+        for a, b in sorted((float(a), float(b)) for a, b in t["me"]):  # merged: a word falls in one span at most
+            if me and a <= me[-1][1]:
+                me[-1][1] = max(me[-1][1], b)
+            else:
+                me.append([a, b])
+        return changes, me
+    except (OSError, ValueError, KeyError, TypeError):  # OSError: no ffprobe
+        return None
+
+
+def by_zoom(words, zoom):
+    """Speakers named by Zoom instead of Scribe's labels: the user by their microphone, everyone else by Zoom's
+    highlight. Where Zoom showed no one, a Scribe label takes the person it clearly matched elsewhere.
+    Sets w["spk"] to "S<id>"; returns ({id: name}, the user's id, share of words named by Zoom or the microphone)."""
+    changes, me = zoom
+    mine = [s for s, _ in me]
+    ids = {}
+    for _, name in changes:
+        if name is not None:
+            ids.setdefault(name, len(ids) + 1)
+
+    def opens(t):
+        """A highlight change at t follows a voice that began just as one of the user's spans did."""
+        j = bisect_right(mine, t - LAG + 0.5) - 1
+        return j >= 0 and me[j][0] - 0.5 <= t - LAG <= min(me[j][1], me[j][0] + 1.5)
+
+    # The user's name: the one Zoom switched to as they began to speak (gallery view highlights the user too,
+    # speaker view never). The window reappearing is no new voice, and the next speaker's highlight comes later.
+    votes = Counter(n for (_, p), (t, n) in zip(changes, changes[1:]) if p and n and opens(t))
+    own, n = (votes.most_common(1) or [(None, 0)])[0]
+    if n < 2 or n < 0.6 * votes.total():
+        own = None
+    own_id = ids[own] if own else len(ids) + 1 if me else None
+    ws = sorted(words, key=lambda w: w["start"])
+    starts = [w["start"] for w in ws]
+
+    def voice_start(t):
+        """The highlight lags the voice: the Scribe label change nearest to LAG before it, else the longest pause."""
+        lo, hi = max(bisect_left(starts, t - 2), 1), bisect_left(starts, t + 0.3)
+        if switches := [starts[i] for i in range(lo, hi) if ws[i]["spk"] != ws[i - 1]["spk"]]:
+            return min(switches, key=lambda x: abs(x - (t - LAG)))
+        gap, at = max(((starts[i] - ws[i - 1]["end"], starts[i]) for i in range(lo, hi)), default=(0, 0))
+        return at if gap >= 0.2 else t - LAG
+
+    segs, prev = [], None  # (from, id or None); the window appearing or hiding is no new voice
+    for t, name in changes:
+        at = voice_start(t) if prev and name else t
+        segs.append((max(at, segs[-1][0]) if segs else at, ids.get(name)))
+        prev = name
+    froms = [s for s, _ in segs]
+    tally, total = defaultdict(Counter), Counter()
+    for w in ws:
+        mid = (w["start"] + w["end"]) / 2
+        j, i = bisect_right(mine, mid + 0.15) - 1, bisect_right(froms, w["start"]) - 1
+        w["zoom"] = own_id if j >= 0 and mid <= me[j][1] + 0.15 else segs[i][1] if i >= 0 else None
+        if w["spk"]:
+            total[w["spk"]] += w["end"] - w["start"]
+            if w["zoom"]:
+                tally[w["spk"]][w["zoom"]] += w["end"] - w["start"]
+    # A label takes a person on real evidence only: most of its named time, and enough of it. Otherwise its id
+    # follows its Scribe number, so names stay put when another label changes.
+    base, label = max([*ids.values(), own_id or 0]), {}
+    for s in total:
+        named = tally[s].total()
+        best, d = (tally[s].most_common(1) or [(None, 0)])[0]
+        label[s] = best if best and d >= 0.6 * named and named >= max(5, 0.3 * total[s]) else base + int(s[1:])
+    named = sum(w["zoom"] is not None for w in ws)
+    for w in ws:
+        sid = w.pop("zoom") or label.get(w["spk"])
+        w["spk"] = f"S{sid}" if sid else None
+    return {str(i): n for n, i in ids.items()}, own_id, named / max(len(ws), 1)
+
+
 def utterances(words):
     utts = []
     for w in words:  # numbered by global label, so names survive re-recognizing the words
@@ -263,7 +348,8 @@ def run(a):
     glossary = ROOT / "glossary.txt"
     terms = (a.terms or "").split(",") + (glossary.read_text().splitlines() if glossary.exists() else [])
     terms = list(dict.fromkeys(x for x in map(str.strip, terms) if x and not x.startswith("#")))  # no duplicates
-    log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(ROOT)}")
+    zoom = zoom_timeline(str(src))
+    log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(ROOT)}" + (", Zoom speakers" if zoom else ""))
 
     def job(name, s, e, model, **extra):
         out, mp3 = d / "raw" / f"{name}.json", work / f"{name}.mp3"
@@ -285,7 +371,7 @@ def run(a):
         spk = [shift(f.result()["words"], s) for (s, _), f in zip(sspans, fs)]
         spk_words = link(spk, [s for s, _ in spans])
         words = [w for w in spk_words if w["start"] < spans[0][0]]  # a skipped lead-in may be quiet speech: Scribe words
-        engine = f"слова: {WORDS_MODEL}, спикеры: {SPK_MODEL}"
+        engine = f"слова: {WORDS_MODEL}, спикеры: {'Zoom и ' if zoom else ''}{SPK_MODEL}"
         for (s, e), f, sw in zip(spans, fw, spk):
             try:
                 words += shift(f.result()["words"], s)
@@ -295,15 +381,21 @@ def run(a):
                 engine += f" (кусок {hms(s)}-{hms(e)}: только {SPK_MODEL})"
 
     turns = turns_of(spk_words)
-    sig = hashlib.sha1(" ".join(t[2] for t in turns).encode()).hexdigest()[:12]
-    utts = utterances(assign(words, turns))
-    t = {"source": str(src), "duration": dur, "engine": engine, "speakers": sig, "names": {}, "utterances": utts}
+    labels = " ".join(t[2] for t in turns) + (json.dumps(zoom, ensure_ascii=False) if zoom else "")
+    sig = hashlib.sha1(labels.encode()).hexdigest()[:12]
+    words, names = assign(words, turns), {}
+    if zoom:
+        names, own, share = by_zoom(words, zoom)
+        print(f"Zoom and the microphone named {share:.0%} of words; own voice: "
+              + (f"{names.get(str(own), f'Спикер {own}')} (speaker {own})" if own else "none"))
+    utts = utterances(words)
+    t = {"source": str(src), "duration": dur, "engine": engine, "speakers": sig, "names": names, "utterances": utts}
     old = d / "transcript.json"
     if old.exists():  # names stay valid while the speaker labels are the same
         o = json.loads(old.read_text())
         if o.get("speakers", sig) == sig:
             t["names"] = o["names"]
-        elif o["names"]:
+        elif o["names"] and o["names"] != names:
             log("names dropped: speaker labels changed, run `names` again")
     old.write_text(json.dumps(t, ensure_ascii=False, indent=1))
     shutil.rmtree(work)
