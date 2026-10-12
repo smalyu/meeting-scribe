@@ -33,7 +33,7 @@ SPK_MODEL = "elevenlabs/scribe-v2"
 CHUNK = 30 * 60  # seconds per request; whole 2.7 h file -> 524 timeout
 OVERLAP = 5 * 60  # speaker chunks overlap the previous one by this much (for linking labels)
 RETRY = {408, 429, 500, 502, 503, 504, 524, 529}
-LAG = 0.7  # Zoom moves its speaker highlight about this long after a new voice (estimate, to be measured)
+LAG = 0.5  # Zoom moves its speaker highlight this long after a new voice (median of 85 switches, 2026-10-12)
 
 
 def log(*a):
@@ -277,18 +277,38 @@ def by_zoom(words, zoom):
             total[w["spk"]] += w["end"] - w["start"]
             if w["zoom"]:
                 tally[w["spk"]][w["zoom"]] += w["end"] - w["start"]
+    evidenced = sum(w["zoom"] is not None for w in ws)
     # A label takes a person on real evidence only: most of its named time, and enough of it. Otherwise its id
     # follows its Scribe number, so names stay put when another label changes.
-    base, label = max([*ids.values(), own_id or 0]), {}
+    base, label, sure = max([*ids.values(), own_id or 0]), {}, {}
     for s in total:
         named = tally[s].total()
         best, d = (tally[s].most_common(1) or [(None, 0)])[0]
         label[s] = best if best and d >= 0.6 * named and named >= max(5, 0.3 * total[s]) else base + int(s[1:])
-    named = sum(w["zoom"] is not None for w in ws)
+        if label[s] == best and d >= 0.85 * named:
+            sure[s] = best
+    # On a Zoom recording Scribe follows voices closely (every person comes through a different channel), while the
+    # highlight lags and the microphone misses quiet words. So a label that is clearly one person names all its words,
+    # unless the evidence clearly gives one of its turns to someone else.
+    i = 0
+    while i < len(ws):
+        j = i + 1
+        while j < len(ws) and ws[j]["spk"] == ws[i]["spk"] and ws[j]["start"] - ws[j - 1]["end"] < 2:
+            j += 1
+        if person := sure.get(ws[i]["spk"]):
+            votes = Counter()
+            for w in ws[i:j]:
+                if w["zoom"]:
+                    votes[w["zoom"]] += w["end"] - w["start"]
+            other, d = (votes.most_common(1) or [(None, 0)])[0]
+            person = other if other != person and d >= max(1, 0.7 * votes.total()) else person
+            for w in ws[i:j]:
+                w["zoom"] = person
+        i = j
     for w in ws:
         sid = w.pop("zoom") or label.get(w["spk"])
         w["spk"] = f"S{sid}" if sid else None
-    return {str(i): n for n, i in ids.items()}, own_id, named / max(len(ws), 1)
+    return {str(i): n for n, i in ids.items()}, own_id, evidenced / max(len(ws), 1)
 
 
 def utterances(words):
