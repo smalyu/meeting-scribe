@@ -14,6 +14,7 @@ Zoom highlighted as speaking and where the user's own voice is: then those name 
 
   uv run scribe.py <audio> [--name slug] [--terms "a,b"]
   uv run scribe.py names <meeting_dir> 2=Андрей 3=Мария
+  uv run scribe.py share <meeting_dir> [topic]   followup.md -> «Итоги встречи ДД.ММ — тема.md» w/o transcript links
 """
 import argparse, base64, hashlib, json, os, re, shutil, subprocess, sys, time, unicodedata
 from array import array
@@ -119,7 +120,9 @@ def transcribe(key, mp3, out, model, **extra):
             r = httpx.post(API, json=body, headers={"Authorization": f"Bearer {key}"},
                            timeout=httpx.Timeout(3600, connect=30))
             if r.status_code == 200 and "words" in (j := r.json()):  # [] is a valid answer: no speech
-                out.write_text(r.text)
+                tmp = out.with_suffix(".tmp")
+                tmp.write_text(r.text)
+                tmp.rename(out)  # a cached answer is always complete
                 log(f"  {out.stem}: {len(j['words'])} words in {time.time() - t0:.0f}s")
                 return j
             msg = f"HTTP {r.status_code}: {r.text.strip()[:500]}"
@@ -208,14 +211,32 @@ def assign(words, turns):
     return words
 
 
-def zoom_timeline(p):
+def tags(p):
+    """Container tags of the recording ({} without any)."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", p],
+                           capture_output=True, text=True, errors="replace")  # tags can be in any encoding
+        return json.loads(r.stdout)["format"].get("tags") or {}
+    except (OSError, ValueError, KeyError, TypeError):  # OSError: no ffprobe
+        return {}
+
+
+def recorded(tags):
+    """The creation_time tag as local time; Zoom Audio Recorder and iPhone Voice Memos set it when the recording
+    ends. None without a real one (1904 is the MP4 epoch)."""
+    try:
+        t = datetime.fromisoformat(tags["creation_time"]).astimezone()
+    except (KeyError, ValueError, OverflowError, OSError):
+        return None
+    return t if t.year >= 2000 else None
+
+
+def zoom_timeline(tags):
     """Zoom Audio Recorder's timeline in the file's description tag: (seconds, name) whenever Zoom highlighted
     another speaker (name None: its meeting window was not visible), and [start, end] spans of the user's own
     voice, found by their microphone. None for other files."""
     try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags=description", "-of", "json", p],
-                           capture_output=True, text=True, errors="replace")
-        t = json.loads(json.loads(r.stdout)["format"]["tags"]["description"])
+        t = json.loads(tags["description"])
         changes = sorted(((float(s), str(n) if n else None) for s, n in t["speakers"]), key=lambda c: c[0])
         me = []
         for a, b in sorted((float(a), float(b)) for a, b in t["me"]):  # merged: a word falls in one span at most
@@ -224,7 +245,7 @@ def zoom_timeline(p):
             else:
                 me.append([a, b])
         return changes, me
-    except (OSError, ValueError, KeyError, TypeError):  # OSError: no ffprobe
+    except (ValueError, KeyError, TypeError):
         return None
 
 
@@ -280,12 +301,12 @@ def by_zoom(words, zoom):
     evidenced = sum(w["zoom"] is not None for w in ws)
     # A label takes a person on real evidence only: most of its named time, and enough of it. Otherwise its id
     # follows its Scribe number, so names stay put when another label changes.
-    base, label, sure = max([*ids.values(), own_id or 0]), {}, {}
+    base, who, sure = max([*ids.values(), own_id or 0]), {}, {}
     for s in total:
         named = tally[s].total()
         best, d = (tally[s].most_common(1) or [(None, 0)])[0]
-        label[s] = best if best and d >= 0.6 * named and named >= max(5, 0.3 * total[s]) else base + int(s[1:])
-        if label[s] == best and d >= 0.85 * named:
+        who[s] = best if best and d >= 0.6 * named and named >= max(5, 0.3 * total[s]) else base + int(s[1:])
+        if who[s] == best and d >= 0.85 * named:
             sure[s] = best
     # On a Zoom recording Scribe follows voices closely (every person comes through a different channel), while the
     # highlight lags and the microphone misses quiet words. So a label that is clearly one person names all its words,
@@ -306,7 +327,7 @@ def by_zoom(words, zoom):
                 w["zoom"] = person
         i = j
     for w in ws:
-        sid = w.pop("zoom") or label.get(w["spk"])
+        sid = w.pop("zoom") or who.get(w["spk"])
         w["spk"] = f"S{sid}" if sid else None
     return {str(i): n for n, i in ids.items()}, own_id, evidenced / max(len(ws), 1)
 
@@ -337,8 +358,10 @@ def render(d):
             b["text"] += " " + u["text"]
         else:
             blocks.append({"start": u["start"], "who": who(u["speaker"]), "text": u["text"]})
-    lines = [f"# {d.name}", "",
-             f"Источник: `{t['source']}` · {hms(t['duration'])} · {t['engine']}", "",
+    meta = [f"`{t['source']}`", hms(t["duration"])]
+    if t.get("recorded"):  # shown in this machine's time zone
+        meta.append(f"{datetime.fromisoformat(t['recorded']).astimezone():%d.%m.%Y %H:%M %Z} (creation_time)")
+    lines = [f"# {d.name}", "", "Источник: " + " · ".join(meta + [t["engine"]]), "",
              "Спикеры: " + ", ".join(f"{s} ({v / 60:.0f} мин)" if v >= 60 else f"{s} ({v:.0f} с)"
                                     for s, v in talk.most_common()), ""]
     lines += [f"**[{hms(b['start'])}] {b['who']}:** {b['text']}\n" for b in blocks]
@@ -350,12 +373,30 @@ def run(a):
     key = api_key()
     src = Path(a.audio).expanduser().resolve()
     st = src.stat()
-    date = datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime)).strftime("%Y-%m-%d")
-    slug = re.sub(r"\W+", "-", unicodedata.normalize("NFC", src.stem).lower()).strip("-")
+    tg = tags(str(src))
+    at = recorded(tg)
+    date = (at or datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime))).strftime("%Y-%m-%d")
+    slug = re.sub(r"\W+", "-", unicodedata.normalize("NFC", src.stem).lower()).replace(date, "")  # date once
+    slug = re.sub(r"-{2,}", "-", slug).strip("-") or "meeting"
     d = ROOT / "meetings" / f"{date}-{a.name or slug}"
-    if not a.name and not d.exists():  # the folder may have been renamed after the first run: find it by the recording
-        d = next((m.parent for m in ROOT.glob(f"meetings/{date}-*/transcript.json")
-                  if f'"source": {json.dumps(str(src), ensure_ascii=False)}' in m.read_text()), d)
+    # the folder may have been renamed after the first run: find it by the recording, so nothing is paid twice
+    mine = f'"source": {json.dumps(str(src), ensure_ascii=False)}'
+
+    def holds(m):  # this recording: the path and the size (the path may hold a re-exported file by now)
+        size = m.parent / "raw" / "size"
+        return mine in m.read_text() and (not size.exists() or size.read_text() == str(st.st_size))
+
+    prior = next((m.parent for m in sorted(ROOT.glob("meetings/*/transcript.json")) if holds(m)), None)
+    if prior and not a.name:
+        d = prior
+    elif prior and prior != d:  # a new slug for a known recording renames its folder, keeping its date
+        if re.match(r"\d{4}-\d\d-\d\d-", prior.name):
+            d = d.with_name(f"{prior.name[:10]}-{a.name}")
+        if d != prior:
+            if d.exists():
+                sys.exit(f"{prior.relative_to(ROOT)} already holds this recording: move it or pick another --name")
+            prior.rename(d)
+            log(f"{prior.relative_to(ROOT)} -> {d.relative_to(ROOT)}")
     mark = d / "raw" / "size"  # same folder + another file (e.g. Zoom's audio_only.m4a) must not reuse the cache
     if mark.exists() and mark.read_text() != str(st.st_size):
         sys.exit(f"{d.relative_to(ROOT)} already holds another recording; pass another --name")
@@ -368,14 +409,17 @@ def run(a):
     glossary = ROOT / "glossary.txt"
     terms = (a.terms or "").split(",") + (glossary.read_text().splitlines() if glossary.exists() else [])
     terms = list(dict.fromkeys(x for x in map(str.strip, terms) if x and not x.startswith("#")))  # no duplicates
-    zoom = zoom_timeline(str(src))
-    log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(ROOT)}" + (", Zoom speakers" if zoom else ""))
+    zoom = zoom_timeline(tg)
+    log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(ROOT)}"
+        + (f", recorded {at:%d.%m.%Y %H:%M %Z}" if at else "") + (", Zoom speakers" if zoom else ""))
+    fresh = set()  # chunks requested (paid) in this run
 
     def job(name, s, e, model, **extra):
         out, mp3 = d / "raw" / f"{name}.json", work / f"{name}.mp3"
         if out.exists():
             log(f"  {name}: cached")
             return json.loads(out.read_text())
+        fresh.add(name)
         if not mp3.exists():
             to_mp3(pcm(str(src), s, e - s), mp3)
         return transcribe(key, mp3, out, model, **extra)
@@ -384,11 +428,24 @@ def run(a):
     w_opts = {"provider": {"options": {"azure": {"phraseList": {"phrases": terms[:50]}}}}} if terms else {}
     shift = lambda ws, s: [w | {"start": w["start"] + s, "end": w["end"] + s} for w in ws if is_word(w)]
     sspans = [(max(s - OVERLAP, 0), e) for s, e in spans]
-    with ThreadPoolExecutor(8) as ex:
-        # cache files are named by chunk start and end, so a changed plan never reuses a stale response
-        fw = [ex.submit(job, f"words_{s:.0f}-{e:.0f}", s, e, WORDS_MODEL, **w_opts) for s, e in spans]
-        fs = [ex.submit(job, f"speakers_{s:.0f}-{e:.0f}", s, e, SPK_MODEL, diarize=True) for s, e in sspans]
-        spk = [shift(f.result()["words"], s) for (s, _), f in zip(sspans, fs)]
+    # cache files are named by chunk start and end, so a changed plan never reuses a stale response
+    wn, sn = [f"words_{s:.0f}-{e:.0f}" for s, e in spans], [f"speakers_{s:.0f}-{e:.0f}" for s, e in sspans]
+    ex, fw, fs = ThreadPoolExecutor(8), [], []  # no `with`: Ctrl-C must not hang on the running requests
+
+    def spent():
+        done = [(n, f.result()) for n, f in zip(wn + sn, fw + fs) if f.done() and not f.cancelled() and not f.exception()]
+        cost = lambda rs: sum(r.get("usage", {}).get("cost", 0) for r in rs)
+        log(f"cost: ${cost(r for _, r in done):.2f} total, ${cost(r for n, r in done if n in fresh):.2f} this run")
+
+    try:
+        fw = [ex.submit(job, n, s, e, WORDS_MODEL, **w_opts) for n, (s, e) in zip(wn, spans)]
+        fs = [ex.submit(job, n, s, e, SPK_MODEL, diarize=True) for n, (s, e) in zip(sn, sspans)]
+        try:
+            spk = [shift(f.result()["words"], s) for (s, _), f in zip(sspans, fs)]
+        except RuntimeError as err:  # API failure after retries (transcribe): no speakers, no transcript
+            ex.shutdown()  # the other requests are paid for: let them finish into the cache
+            spent()
+            sys.exit(f"{err}\nrerun the same command: finished chunks are cached in raw/")
         spk_words = link(spk, [s for s, _ in spans])
         words = [w for w in spk_words if w["start"] < spans[0][0]]  # a skipped lead-in may be quiet speech: Scribe words
         engine = f"слова: {WORDS_MODEL}, спикеры: {'Zoom и ' if zoom else ''}{SPK_MODEL}"
@@ -399,6 +456,19 @@ def run(a):
                 log(f"WARNING: words {hms(s)}-{hms(e)} failed ({err}); using {SPK_MODEL} words there")
                 words += [w for w in sw if s <= w["start"] < e]
                 engine += f" (кусок {hms(s)}-{hms(e)}: только {SPK_MODEL})"
+    except KeyboardInterrupt:
+        ex.shutdown(wait=False, cancel_futures=True)  # not yet sent: not paid
+        if sent := sum(f.running() for f in fw + fs):
+            log(f"interrupted: waiting for {sent} sent (paid) request(s) to land in raw/; Ctrl-C again drops them")
+            try:
+                ex.shutdown()
+            except KeyboardInterrupt:
+                pass
+        os._exit(130)
+    ex.shutdown()
+    spent()
+    if a.terms and not any(n.startswith("words_") for n in fresh):
+        log("--terms had no effect: words came from the cache (delete raw/words_*.json to re-recognize)")
 
     turns = turns_of(spk_words)
     labels = " ".join(t[2] for t in turns) + (json.dumps(zoom, ensure_ascii=False) if zoom else "")
@@ -409,7 +479,8 @@ def run(a):
         print(f"Zoom and the microphone named {share:.0%} of words; own voice: "
               + (f"{names.get(str(own), f'Спикер {own}')} (speaker {own})" if own else "none"))
     utts = utterances(words)
-    t = {"source": str(src), "duration": dur, "engine": engine, "speakers": sig, "names": names, "utterances": utts}
+    t = {"source": str(src), "duration": dur, "recorded": at.isoformat(timespec="minutes") if at else None,
+         "engine": engine, "speakers": sig, "names": names, "utterances": utts}
     old = d / "transcript.json"
     if old.exists():  # names stay valid while the speaker labels are the same
         o = json.loads(old.read_text())
@@ -423,8 +494,15 @@ def run(a):
     print(f"{len(words)} words, {len(utts)} utterances, {len({u['speaker'] for u in utts})} speakers")
 
 
+def meeting(path):
+    d = Path(path).expanduser().resolve()
+    if not (d / "transcript.json").exists():
+        sys.exit(f"{d}: no transcript.json")
+    return d
+
+
 def names(a):
-    d = Path(a.dir).resolve()
+    d = meeting(a.dir)
     t = json.loads((d / "transcript.json").read_text())
     pairs = dict(p.partition("=")[::2] for p in a.pairs)
     known = {str(u["speaker"]) for u in t["utterances"]}
@@ -435,6 +513,33 @@ def names(a):
     print(render(d))
 
 
+def share(a):
+    """followup.md -> «Итоги встречи ДД.ММ — <тема>.md» for the participants' chat: the heading gives the date and
+    the topic, lines that link to transcripts are dropped (the participants have none)."""
+    d = meeting(a.dir)
+    if not (d / "followup.md").exists():
+        sys.exit(f"{d / 'followup.md'}: not found")
+    text = (d / "followup.md").read_text()
+    m = re.match(r"# (.+) — итоги встречи (\d\d)\.(\d\d)\.\d{4}( \(\?\))?\s*$", text.partition("\n")[0])
+    if not m:
+        sys.exit("followup.md must start with «# <Тема> — итоги встречи ДД.ММ.ГГГГ»")
+    topic, dd, mm, _ = m.groups()
+    kept = []
+    for line in text.splitlines():
+        if re.search(r"\]\([^)]*transcript\.md\)", line):
+            log(f"  dropped: {line}")
+        else:
+            kept.append(line)
+    name = (a.topic or topic).replace(": ", " — ").replace(":", ".").replace("/", "-")
+    out = d / f"Итоги встречи {dd}.{mm} — {name}.md"
+    for old in d.glob("Итоги встречи *.md"):  # one copy, or an outdated one could get sent
+        if old != out:
+            old.unlink()
+            log(f"  removed {old.name}")
+    out.write_text(re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).rstrip() + "\n")
+    print(out)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     if sys.argv[1:2] == ["names"]:
@@ -442,6 +547,11 @@ if __name__ == "__main__":
         p.add_argument("dir")
         p.add_argument("pairs", nargs="+", metavar="N=Имя")
         names(p.parse_args())
+    elif sys.argv[1:2] == ["share"]:
+        p.add_argument("cmd", metavar="share")
+        p.add_argument("dir")
+        p.add_argument("topic", nargs="?", help="topic for the file name when the heading's is too long")
+        share(p.parse_args())
     else:
         p.add_argument("audio")
         p.add_argument("--name", help="slug for meetings/<date>-<slug>")
