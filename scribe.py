@@ -289,15 +289,29 @@ def by_zoom(words, zoom):
         segs.append((max(at, segs[-1][0]) if segs else at, ids.get(name)))
         prev = name
     froms = [s for s, _ in segs]
-    tally, total = defaultdict(Counter), Counter()
-    for w in ws:
+
+    def heard(w):
         mid = (w["start"] + w["end"]) / 2
-        j, i = bisect_right(mine, mid + 0.15) - 1, bisect_right(froms, w["start"]) - 1
-        w["zoom"] = own_id if j >= 0 and mid <= me[j][1] + 0.15 else segs[i][1] if i >= 0 else None
+        j = bisect_right(mine, mid + 0.15) - 1
+        return j >= 0 and mid <= me[j][1] + 0.15
+
+    mic, total, loud = [heard(w) for w in ws], Counter(), Counter()
+    for w, m in zip(ws, mic):
         if w["spk"]:
             total[w["spk"]] += w["end"] - w["start"]
-            if w["zoom"]:
-                tally[w["spk"]][w["zoom"]] += w["end"] - w["start"]
+            loud[w["spk"]] += m * (w["end"] - w["start"])
+    tally = defaultdict(Counter)
+    for w, m in zip(ws, mic):
+        i = bisect_right(froms, w["start"]) - 1
+        lit = segs[i][1] if i >= 0 else None
+        # Zoom lighting the user up while their microphone is silent: quiet words the microphone missed, if it hears
+        # this Scribe label at times (8 Zoom calls: the user's labels 61%+, mixed ones 8%+). A label it hardly ever
+        # hears is another voice under a stuck highlight (2026-10-21: stuck on the user for 15 minutes; that label 2%).
+        if lit == own_id and w["spk"] and loud[w["spk"]] < 0.05 * total[w["spk"]]:
+            lit = None
+        w["zoom"] = own_id if m else lit
+        if w["spk"] and w["zoom"]:
+            tally[w["spk"]][w["zoom"]] += w["end"] - w["start"]
     evidenced = sum(w["zoom"] is not None for w in ws)
     # A label takes a person on real evidence only: most of its named time, and enough of it. Otherwise its id
     # follows its Scribe number, so names stay put when another label changes.
