@@ -255,6 +255,13 @@ def by_zoom(words, zoom):
     Sets w["spk"] to "S<id>"; returns ({id: name}, the user's id, share of words named by Zoom or the microphone)."""
     changes, me = zoom
     mine = [s for s, _ in me]
+    shown = {name for _, name in changes if name is not None}
+    # One name lit all call long while the user spoke: the highlight never followed a voice. It may be the user, stuck
+    # (2026-10-21, a 13-minute call: the user's name went to the other speaker's words), or the one other person in
+    # speaker view; nothing tells which, so it names no one.
+    if len(shown) == 1 and sum(e - s for s, e in me) >= 5:
+        log(f"Zoom lit only {shown.pop()} all call long: highlight ignored, speakers by microphone and Scribe")
+        changes = [(t, None) for t, _ in changes]
     ids = {}
     for _, name in changes:
         if name is not None:
@@ -319,6 +326,11 @@ def by_zoom(words, zoom):
     for s in total:
         named = tally[s].total()
         best, d = (tally[s].most_common(1) or [(None, 0)])[0]
+        # The microphone hears the user's own labels 61%+ (9 Zoom calls), mixed ones 8-44%. A label it hears less
+        # than half is not the user's, even with no one else lit: its silent words are another voice (2026-10-21:
+        # Scribe merged both speakers into one label, heard 42%).
+        if best == own_id and loud[s] < 0.5 * total[s]:
+            best = None
         who[s] = best if best and d >= 0.6 * named and named >= max(5, 0.3 * total[s]) else base + int(s[1:])
         if who[s] == best and d >= 0.85 * named:
             sure[s] = best

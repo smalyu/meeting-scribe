@@ -139,6 +139,16 @@ def test_by_zoom_ignores_a_highlight_stuck_on_the_user():
     assert [w["spk"] for w in words] == ["S1"] * 10 + ["S2"] * 10 + ["S1"] * 10 + ["S2"] * 10 + ["S1"] * 20
 
 
+def test_by_zoom_ignores_one_name_lit_all_call_long():
+    words = zw(range(0, 10), "S1") + zw(range(10, 40), "S2") + zw(range(40, 50), "S1")  # S2: the user merged with S1
+    zoom = ([(0, "Me")], [[10, 20]])  # the highlight never moved; the microphone hears a third of S2
+    names, own, share = scribe.by_zoom(words, zoom)
+    assert names == {} and own == 1 and share == 10 / 50
+    assert [w["spk"] for w in words] == ["S2"] * 10 + ["S1"] * 10 + ["S3"] * 20 + ["S2"] * 10
+    words = zw(range(0, 10), "S1")  # the user silent: one name all along is just who spoke
+    assert scribe.by_zoom(words, ([(0, "Ann")], []))[0] == {"1": "Ann"} and {w["spk"] for w in words} == {"S1"}
+
+
 def test_by_zoom_numbers_the_user_and_unseen_labels_when_zoom_shows_nothing():
     words = zw(range(0, 30), "S1") + zw(range(30, 40), "S2") + zw(range(40, 50), "S3") + zw(range(50, 56), "S4")
     zoom = ([(0, "Ann"), (40.5, "Bob"), (49.5, None)], [[30, 40]])  # speaker view; the window hidden from 49.5
