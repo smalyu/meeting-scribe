@@ -139,6 +139,15 @@ def test_by_zoom_ignores_a_highlight_stuck_on_the_user():
     assert [w["spk"] for w in words] == ["S1"] * 10 + ["S2"] * 10 + ["S1"] * 10 + ["S2"] * 10 + ["S1"] * 20
 
 
+def test_by_zoom_finds_the_user_whose_microphone_catches_their_start_late():
+    words = (zw(range(0, 10), "S1") + zw(range(10, 20), "S2") + zw(range(20, 30), "S1")
+             + zw(range(30, 40), "S2") + zw(range(40, 60), "S1"))
+    zoom = ([(0, "Ann"), (10.5, "Me"), (20.5, "Ann"), (30.5, "Me")], [[12, 20], [33, 40]])  # quiet starts missed
+    names, own, _ = scribe.by_zoom(words, zoom)  # Scribe's turns of S2 show when the user began: the highlight followed
+    assert names == {"1": "Ann", "2": "Me"} and own == 2  # so Ann's words under the stuck highlight are not the user's
+    assert [w["spk"] for w in words] == ["S1"] * 10 + ["S2"] * 10 + ["S1"] * 10 + ["S2"] * 10 + ["S1"] * 20
+
+
 def test_by_zoom_ignores_one_name_lit_all_call_long():
     words = zw(range(0, 10), "S1") + zw(range(10, 40), "S2") + zw(range(40, 50), "S1")  # S2: the user merged with S1
     zoom = ([(0, "Me")], [[10, 20]])  # the highlight never moved; the microphone hears a third of S2

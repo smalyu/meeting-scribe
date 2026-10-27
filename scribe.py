@@ -267,11 +267,32 @@ def by_zoom(words, zoom):
     for _, name in changes:
         if name is not None:
             ids.setdefault(name, len(ids) + 1)
+    ws = sorted(words, key=lambda w: w["start"])
+    starts = [w["start"] for w in ws]
+
+    def heard(w):
+        mid = (w["start"] + w["end"]) / 2
+        j = bisect_right(mine, mid + 0.15) - 1
+        return j >= 0 and mid <= me[j][1] + 0.15
+
+    mic, total, loud = [heard(w) for w in ws], Counter(), Counter()
+    for w, m in zip(ws, mic):
+        if w["spk"]:
+            total[w["spk"]] += w["end"] - w["start"]
+            loud[w["spk"]] += m * (w["end"] - w["start"])
+    # Turns of the user's own Scribe labels: the microphone hears those 61%+ (10 Zoom calls), mixed ones 8-44%
+    theirs = {s for s in total if loud[s] >= 0.5 * total[s]}
+    begins = [w["start"] for i, w in enumerate(ws) if w["spk"] in theirs
+              and (i == 0 or ws[i - 1]["spk"] != w["spk"] or w["start"] - ws[i - 1]["end"] >= 1)]
 
     def opens(t):
-        """A highlight change at t follows a voice that began just as one of the user's spans did."""
+        """A highlight change at t follows a voice that began just as one of the user's spans or turns did. The
+        microphone may catch a quiet start late (2026-10-27: 0.9 and 2.6 s late, so their name went to the other)."""
         j = bisect_right(mine, t - LAG + 0.5) - 1
-        return j >= 0 and me[j][0] - 0.5 <= t - LAG <= min(me[j][1], me[j][0] + 1.5)
+        if j >= 0 and me[j][0] - 0.5 <= t - LAG <= min(me[j][1], me[j][0] + 1.5):
+            return True
+        k = bisect_left(begins, t - LAG - 1.5)
+        return k < len(begins) and begins[k] <= t - LAG + 0.5
 
     # The user's name: the one Zoom switched to as they began to speak (gallery view highlights the user too,
     # speaker view never). The window reappearing is no new voice, and the next speaker's highlight comes later.
@@ -280,8 +301,6 @@ def by_zoom(words, zoom):
     if n < 2 or n < 0.6 * votes.total():
         own = None
     own_id = ids[own] if own else len(ids) + 1 if me else None
-    ws = sorted(words, key=lambda w: w["start"])
-    starts = [w["start"] for w in ws]
 
     def voice_start(t):
         """The highlight lags the voice: the Scribe label change nearest to LAG before it, else the longest pause."""
@@ -297,17 +316,6 @@ def by_zoom(words, zoom):
         segs.append((max(at, segs[-1][0]) if segs else at, ids.get(name)))
         prev = name
     froms = [s for s, _ in segs]
-
-    def heard(w):
-        mid = (w["start"] + w["end"]) / 2
-        j = bisect_right(mine, mid + 0.15) - 1
-        return j >= 0 and mid <= me[j][1] + 0.15
-
-    mic, total, loud = [heard(w) for w in ws], Counter(), Counter()
-    for w, m in zip(ws, mic):
-        if w["spk"]:
-            total[w["spk"]] += w["end"] - w["start"]
-            loud[w["spk"]] += m * (w["end"] - w["start"])
     tally = defaultdict(Counter)
     for w, m in zip(ws, mic):
         i = bisect_right(froms, w["start"]) - 1
