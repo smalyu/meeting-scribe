@@ -14,6 +14,7 @@ Zoom highlighted as speaking and where the user's own voice is: then those name 
 
   uv run scribe.py <audio> [--name slug] [--terms "a,b"]
   uv run scribe.py names <meeting_dir> 2=Андрей 3=Мария
+  uv run scribe.py join <meeting_dir> <dir_2> ...   later recordings into <meeting_dir>/2/...: one transcript.md
   uv run scribe.py share <meeting_dir> [topic]   followup.md -> «Итоги встречи ДД.ММ — тема.md» w/o transcript links
 """
 import argparse, base64, hashlib, json, os, re, shutil, subprocess, sys, time, unicodedata
@@ -373,24 +374,46 @@ def utterances(words):
 
 # --- output ------------------------------------------------------------------
 
+def parts(d):
+    """Later recordings of the same meeting, moved into its folder by `join` as 2/, 3/, ..."""
+    return sorted((p for p in d.iterdir() if (p / "transcript.json").exists()), key=lambda p: (len(p.name), p.name))
+
+
 def render(d):
-    t = json.loads((d / "transcript.json").read_text())
-    who = lambda s: t["names"].get(str(s), f"Спикер {s}")
-    blocks, talk = [], Counter()
-    for u in t["utterances"]:  # labels mapped to one name merge into one paragraph
-        talk[who(u["speaker"])] += u["end"] - u["start"]
-        b = blocks[-1] if blocks else None
-        if b and b["who"] == who(u["speaker"]) and u["start"] - b["start"] < 90:
-            b["text"] += " " + u["text"]
-        else:
-            blocks.append({"start": u["start"], "who": who(u["speaker"]), "text": u["text"]})
-    meta = [f"`{t['source']}`", hms(t["duration"])]
-    if t.get("recorded"):  # shown in this machine's time zone
-        meta.append(f"{datetime.fromisoformat(t['recorded']).astimezone():%d.%m.%Y %H:%M %Z} (creation_time)")
-    lines = [f"# {d.name}", "", "Источник: " + " · ".join(meta + [t["engine"]]), "",
-             "Спикеры: " + ", ".join(f"{s} ({v / 60:.0f} мин)" if v >= 60 else f"{s} ({v:.0f} с)"
-                                    for s, v in talk.most_common()), ""]
-    lines += [f"**[{hms(b['start'])}] {b['who']}:** {b['text']}\n" for b in blocks]
+    """transcript.md of the meeting: one recording, or several with timecodes [N·ЧЧ:ММ:СС]."""
+    if (d.parent / "transcript.json").exists():  # a later recording: the meeting's transcript shows it
+        return render(d.parent)
+    recs = [d] + parts(d)
+    many, talk, sections = len(recs) > 1, Counter(), []
+    for i, r in enumerate(recs, 1):
+        t = json.loads((r / "transcript.json").read_text())
+        # labels are per recording: an unnamed one carries its recording's number, «Спикер 2·1»
+        who = lambda s: t["names"].get(str(s), f"Спикер {i}·{s}" if many else f"Спикер {s}")
+        blocks = []
+        for u in t["utterances"]:  # labels mapped to one name merge into one paragraph
+            talk[who(u["speaker"])] += u["end"] - u["start"]
+            b = blocks[-1] if blocks else None
+            if b and b["who"] == who(u["speaker"]) and u["start"] - b["start"] < 90:
+                b["text"] += " " + u["text"]
+            else:
+                blocks.append({"start": u["start"], "who": who(u["speaker"]), "text": u["text"]})
+        meta = [f"`{t['source']}`", hms(t["duration"])]
+        if t.get("recorded"):  # shown in this machine's time zone
+            meta.append(f"{datetime.fromisoformat(t['recorded']).astimezone():%d.%m.%Y %H:%M %Z} (creation_time)")
+        # note.md: what the recording missed, e.g. the user's account of an unrecorded start
+        note = [(r / "note.md").read_text().strip(), ""] if (r / "note.md").exists() else []
+        tc = f"{i}·" if many else ""
+        sections.append(("Источник: " + " · ".join(meta + [t["engine"]]),
+                         note + [f"**[{tc}{hms(b['start'])}] {b['who']}:** {b['text']}\n" for b in blocks]))
+    who_talked = "Спикеры: " + ", ".join(f"{s} ({v / 60:.0f} мин)" if v >= 60 else f"{s} ({v:.0f} с)"
+                                         for s, v in talk.most_common())
+    lines = [f"# {d.name}", ""]
+    if many:
+        lines += [f"Записей: {len(recs)}. Таймкоды [N·ЧЧ:ММ:СС] — время от начала записи N.", "", who_talked, ""]
+        for i, (source, body) in enumerate(sections, 1):
+            lines += [f"## Запись {i}", "", source, ""] + body
+    else:
+        lines += [sections[0][0], "", who_talked, ""] + sections[0][1]
     (d / "transcript.md").write_text("\n".join(lines))
     return d / "transcript.md"
 
@@ -412,8 +435,11 @@ def run(a):
         size = m.parent / "raw" / "size"
         return mine in m.read_text() and (not size.exists() or size.read_text() == str(st.st_size))
 
-    prior = next((m.parent for m in sorted(ROOT.glob("meetings/*/transcript.json")) if holds(m)), None)
-    if prior and not a.name:
+    known = sorted(ROOT.glob("meetings/*/transcript.json")) + sorted(ROOT.glob("meetings/*/*/transcript.json"))
+    prior = next((m.parent for m in known if holds(m)), None)
+    if prior and (not a.name or prior.parent != ROOT / "meetings"):  # a joined recording stays in its meeting
+        if a.name and prior.parent != ROOT / "meetings":
+            log(f"--name ignored: {prior.relative_to(ROOT)} is a part of a joined meeting")
         d = prior
     elif prior and prior != d:  # a new slug for a known recording renames its folder, keeping its date
         if re.match(r"\d{4}-\d\d-\d\d-", prior.name):
@@ -539,6 +565,21 @@ def names(a):
     print(render(d))
 
 
+def join(a):
+    """Later recordings of one meeting go into its folder as 2/, 3/, ... with their cache: one transcript.md."""
+    d = meeting(a.dir)
+    if (d.parent / "transcript.json").exists():
+        sys.exit(f"{d}: a part of a joined meeting; join into {d.parent}")
+    for p in map(meeting, a.parts):
+        if p == d or parts(p):
+            sys.exit(f"{p}: cannot join a meeting into {d}")
+        to = d / str(len(parts(d)) + 2)
+        (p / "transcript.md").unlink(missing_ok=True)  # the meeting's transcript.md shows it now
+        p.rename(to)
+        log(f"{p.name} -> {d.name}/{to.name}")
+    print(render(d))
+
+
 def share(a):
     """followup.md -> «Итоги встречи ДД.ММ — <тема>.md» for the participants' chat: the heading gives the date and
     the topic, lines that link to transcripts are dropped (the participants have none)."""
@@ -573,6 +614,11 @@ if __name__ == "__main__":
         p.add_argument("dir")
         p.add_argument("pairs", nargs="+", metavar="N=Имя")
         names(p.parse_args())
+    elif sys.argv[1:2] == ["join"]:
+        p.add_argument("cmd", metavar="join")
+        p.add_argument("dir", help="the meeting's folder (its first recording)")
+        p.add_argument("parts", nargs="+", metavar="dir", help="folders of its later recordings, in order")
+        join(p.parse_args())
     elif sys.argv[1:2] == ["share"]:
         p.add_argument("cmd", metavar="share")
         p.add_argument("dir")

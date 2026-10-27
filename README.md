@@ -57,6 +57,7 @@ claude                  # и дать путь к записи
 ```bash
 uv run scribe.py ~/Downloads/sync.m4a --terms "Kubernetes,Иван Петров"
 uv run scribe.py names meetings/2026-10-08-sync 2=Андрей 3=Мария
+uv run scribe.py join meetings/2026-10-08-sync meetings/2026-10-08-sync-2   # две записи одной встречи → один транскрипт
 uv run scribe.py share meetings/2026-10-08-sync    # followup.md → копия для чата участников
 ```
 

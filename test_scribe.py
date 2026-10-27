@@ -178,6 +178,9 @@ def test_utterances_render_and_names(tmp_path):
     scribe.names(argparse.Namespace(dir=str(d), pairs=["1=Андрей", "2="]))  # 2= resets to «Спикер 2»
     assert json.loads((d / "transcript.json").read_text())["names"] == {"1": "Андрей"}
     assert "**[00:00:01] Спикер 2:** Да." in (d / "transcript.md").read_text()
+    (d / "note.md").write_text("**До записи:** начало не записано.\n")  # survives every re-render
+    scribe.names(argparse.Namespace(dir=str(d), pairs=["2=Мария"]))
+    assert "(0 с)\n\n**До записи:** начало не записано.\n\n**[00:00:00] Андрей:**" in (d / "transcript.md").read_text()
     with pytest.raises(SystemExit, match="no such speaker"):
         scribe.names(argparse.Namespace(dir=str(d), pairs=["9=Кто-то"]))
     with pytest.raises(SystemExit, match="no transcript.json"):
@@ -288,6 +291,32 @@ def test_run_folders_never_pay_twice(home, monkeypatch, capsys):
     go()  # without --name the renamed folder is found as well
     assert len(calls) == 4 and {p.name for p in (home / "meetings").iterdir()} == {first.name, "2020-01-01-v3", "2020-01-01-v4"}
     assert "meetings/2020-01-01-v2 -> meetings/2020-01-01-v3" in capsys.readouterr().err
+
+
+def test_join_makes_one_transcript_and_reruns_never_pay(home, monkeypatch, capsys):
+    one, two = wav(home / "one.wav", [(12, 0.3)]), wav(home / "two.wav", [(12, 0.3)])
+    calls = []
+    monkeypatch.setattr(scribe.httpx, "post", fake_api({scribe.WORDS_MODEL: MAI, scribe.SPK_MODEL: SCRIBE}, calls))
+    go = lambda rec, name=None: scribe.run(argparse.Namespace(audio=str(rec), name=name, terms=None))
+    go(one, "sync"), go(two, "sync-2")
+    d, d2 = sorted((home / "meetings").iterdir())
+    (d / "note.md").write_text("**До записи:** начало не записано.")
+    scribe.join(argparse.Namespace(dir=str(d), parts=[str(d2)]))
+    assert [p.name for p in (home / "meetings").iterdir()] == [d.name] and (d / "2" / "raw" / "words_0-12.json").exists()
+    scribe.names(argparse.Namespace(dir=str(d / "2"), pairs=["1=Ann"]))  # names of a part re-render the meeting
+    md = (d / "transcript.md").read_text()
+    assert md.startswith(f"# {d.name}\n\nЗаписей: 2. Таймкоды [N·ЧЧ:ММ:СС] — время от начала записи N.\n\n"
+                         "Спикеры: Спикер 1·1 (5 с), Спикер 1·2 (5 с), Ann (5 с), Спикер 2·2 (5 с)\n\n"
+                         "## Запись 1\n\nИсточник: `")  # labels of different recordings are not summed
+    assert "\n\n**До записи:** начало не записано.\n\n**[1·00:00:00] Спикер 1·1:** Привет" in md
+    assert "\n## Запись 2\n\nИсточник: `" in md and "**[2·00:00:00] Ann:** Привет" in md
+    assert "**[2·00:00:06] Спикер 2·2:** Пока" in md and f"{d2.name} -> {d.name}/2" in capsys.readouterr().err
+    assert not (d / "2" / "transcript.md").exists()
+    go(two, "other"), go(one)  # both found where they are now: nothing paid, the part is not moved out
+    assert len(calls) == 4 and (d / "2" / "transcript.json").exists() and "**[2·00:00:00] Ann:**" in md
+    assert "--name ignored" in capsys.readouterr().err
+    with pytest.raises(SystemExit, match="a part of a joined meeting"):
+        scribe.join(argparse.Namespace(dir=str(d / "2"), parts=[str(d)]))
 
 
 def test_run_falls_back_to_scribe_words_when_mai_fails(home, monkeypatch, capsys):
