@@ -12,12 +12,13 @@ Speaker chunks overlap by 5 min; labels are linked through the words they share 
 Each MAI word then gets the speaker by time overlap. A Zoom Audio Recorder file also carries who
 Zoom highlighted as speaking and where the user's own voice is: then those name the speakers.
 
-  uv run scribe.py <audio> [--name slug] [--terms "a,b"]
+  uv run scribe.py <audio> [--name slug] [--terms "a,b"] [--cache-only]
+  uv run scribe.py check <meeting_dir>   rebuild a temporary copy from cache; compare without changing the meeting
   uv run scribe.py names <meeting_dir> 2=Андрей 3=Мария
   uv run scribe.py join <meeting_dir> <dir_2> ...   later recordings into <meeting_dir>/2/...: one transcript.md
   uv run scribe.py share <meeting_dir> [topic]   followup.md -> «Итоги встречи ДД.ММ — тема.md» w/o transcript links
 """
-import argparse, base64, hashlib, json, os, re, shutil, subprocess, sys, time, unicodedata
+import argparse, base64, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, unicodedata
 from array import array
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
@@ -426,8 +427,10 @@ def render(d):
     return d / "transcript.md"
 
 
-def run(a):
-    key = api_key()
+def run(a, root=None):
+    root = ROOT if root is None else root
+    cache_only = getattr(a, "cache_only", False)
+    key = None if cache_only else api_key()
     src = Path(a.audio).expanduser().resolve()
     st = src.stat()
     tg = tags(str(src))
@@ -435,7 +438,7 @@ def run(a):
     date = (at or datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime))).strftime("%Y-%m-%d")
     slug = re.sub(r"\W+", "-", unicodedata.normalize("NFC", src.stem).lower()).replace(date, "")  # date once
     slug = re.sub(r"-{2,}", "-", slug).strip("-") or "meeting"
-    d = ROOT / "meetings" / f"{date}-{a.name or slug}"
+    d = root / "meetings" / f"{date}-{a.name or slug}"
     # the folder may have been renamed after the first run: find it by the recording, so nothing is paid twice
     mine = f'"source": {json.dumps(str(src), ensure_ascii=False)}'
 
@@ -443,34 +446,46 @@ def run(a):
         size = m.parent / "raw" / "size"
         return mine in m.read_text() and (not size.exists() or size.read_text() == str(st.st_size))
 
-    known = sorted(ROOT.glob("meetings/*/transcript.json")) + sorted(ROOT.glob("meetings/*/*/transcript.json"))
+    known = sorted(root.glob("meetings/*/transcript.json")) + sorted(root.glob("meetings/*/*/transcript.json"))
     prior = next((m.parent for m in known if holds(m)), None)
-    if prior and (not a.name or prior.parent != ROOT / "meetings"):  # a joined recording stays in its meeting
-        if a.name and prior.parent != ROOT / "meetings":
-            log(f"--name ignored: {prior.relative_to(ROOT)} is a part of a joined meeting")
+    rename_from = None
+    if prior and (not a.name or prior.parent != root / "meetings"):  # a joined recording stays in its meeting
+        if a.name and prior.parent != root / "meetings":
+            log(f"--name ignored: {prior.relative_to(root)} is a part of a joined meeting")
         d = prior
     elif prior and prior != d:  # a new slug for a known recording renames its folder, keeping its date
         if re.match(r"\d{4}-\d\d-\d\d-", prior.name):
             d = d.with_name(f"{prior.name[:10]}-{a.name}")
         if d != prior:
             if d.exists():
-                sys.exit(f"{prior.relative_to(ROOT)} already holds this recording: move it or pick another --name")
-            prior.rename(d)
-            log(f"{prior.relative_to(ROOT)} -> {d.relative_to(ROOT)}")
-    mark = d / "raw" / "size"  # same folder + another file (e.g. Zoom's audio_only.m4a) must not reuse the cache
+                sys.exit(f"{prior.relative_to(root)} already holds this recording: move it or pick another --name")
+            rename_from = prior
+    cache = (rename_from or d) / "raw"
+    mark = cache / "size"  # same folder + another file (e.g. Zoom's audio_only.m4a) must not reuse the cache
     if mark.exists() and mark.read_text() != str(st.st_size):
-        sys.exit(f"{d.relative_to(ROOT)} already holds another recording; pass another --name")
+        sys.exit(f"{d.relative_to(root)} already holds another recording; pass another --name")
     dur, sil = scan(str(src))
     spans = plan(str(src), dur, sil)
+    sspans = [(max(s - OVERLAP, 0), e) for s, e in spans]
+    # A changed plan uses different cache names. Check every chunk before renaming or writing anything.
+    wn, sn = [f"words_{s:.0f}-{e:.0f}" for s, e in spans], [f"speakers_{s:.0f}-{e:.0f}" for s, e in sspans]
+    if cache_only:
+        missing = [n + ".json" for n in wn + sn if not (cache / (n + ".json")).is_file()]
+        if missing:
+            sys.exit(f"--cache-only: missing cached response(s) in {cache}: " + ", ".join(missing))
+    if rename_from:
+        rename_from.rename(d)
+        log(f"{rename_from.relative_to(root)} -> {d.relative_to(root)}")
     work = d / "work"
     work.mkdir(parents=True, exist_ok=True)
+    mark = d / "raw" / "size"
     mark.parent.mkdir(exist_ok=True)
     mark.write_text(str(st.st_size))
-    glossary = ROOT / "glossary.txt"
+    glossary = root / "glossary.txt"
     terms = (a.terms or "").split(",") + (glossary.read_text().splitlines() if glossary.exists() else [])
     terms = list(dict.fromkeys(x for x in map(str.strip, terms) if x and not x.startswith("#")))  # no duplicates
     zoom = zoom_timeline(tg)
-    log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(ROOT)}"
+    log(f"{src.name}: {hms(dur)}, {len(spans)} chunk(s) -> {d.relative_to(root)}"
         + (f", recorded {at:%d.%m.%Y %H:%M %Z}" if at else "") + (", Zoom speakers" if zoom else ""))
     fresh = set()  # chunks requested (paid) in this run
 
@@ -479,6 +494,8 @@ def run(a):
         if out.exists():
             log(f"  {name}: cached")
             return json.loads(out.read_text())
+        if cache_only:  # also guard against a cache file removed after the preflight check
+            sys.exit(f"--cache-only: missing cached response: {out}")
         fresh.add(name)
         if not mp3.exists():
             to_mp3(pcm(str(src), s, e - s), mp3)
@@ -487,9 +504,6 @@ def run(a):
     # OpenRouter rejects `keyterms` for both models; MAI takes a phrase list via Azure passthrough
     w_opts = {"provider": {"options": {"azure": {"phraseList": {"phrases": terms[:50]}}}}} if terms else {}
     shift = lambda ws, s: [w | {"start": w["start"] + s, "end": w["end"] + s} for w in ws if is_word(w)]
-    sspans = [(max(s - OVERLAP, 0), e) for s, e in spans]
-    # cache files are named by chunk start and end, so a changed plan never reuses a stale response
-    wn, sn = [f"words_{s:.0f}-{e:.0f}" for s, e in spans], [f"speakers_{s:.0f}-{e:.0f}" for s, e in sspans]
     ex, fw, fs = ThreadPoolExecutor(8), [], []  # no `with`: Ctrl-C must not hang on the running requests
 
     def spent():
@@ -561,6 +575,45 @@ def meeting(path):
     return d
 
 
+def check(a):
+    """Rebuild a meeting (including joined recordings) in a temporary directory, strictly from cache."""
+    d = meeting(a.dir)
+    if (d.parent / "transcript.json").exists():
+        d = d.parent
+    recs = [d] + parts(d)
+    changed = []
+    with tempfile.TemporaryDirectory(prefix="meeting-scribe-check-") as scratch:
+        root = Path(scratch)
+        copy = root / "meetings" / d.name
+        for r in recs:
+            dest = copy / r.relative_to(d)
+            dest.mkdir(parents=True)
+            # Copy only the inputs needed for a rebuild; no audio, clips or unrelated meeting files.
+            for name in ("transcript.json", "transcript.md", "note.md"):
+                if (r / name).exists():
+                    shutil.copy2(r / name, dest / name)
+            if (r / "raw").exists():
+                shutil.copytree(r / "raw", dest / "raw")
+        for r in recs:
+            source = json.loads((r / "transcript.json").read_text())["source"]
+            if not Path(source).is_file():
+                sys.exit(f"check: source audio not found: {source}")
+            run(argparse.Namespace(audio=source, name=None, terms=None, cache_only=True), root=root)
+        for r in recs:
+            rel = r.relative_to(d) / "transcript.json"
+            before, after = json.loads((d / rel).read_text()), json.loads((copy / rel).read_text())
+            if before != after:
+                fields = ", ".join(sorted(k for k in before.keys() | after.keys()
+                                          if k not in before or k not in after or before[k] != after[k]))
+                changed.append(f"{rel} ({fields})")
+        if not (d / "transcript.md").exists() or (d / "transcript.md").read_bytes() != (copy / "transcript.md").read_bytes():
+            changed.append("transcript.md")
+    if changed:
+        sys.exit("check: rebuilt copy differs: " + "; ".join(changed)
+                 + "\nManual transcript edits can explain differences; original files were not changed.")
+    print(f"check: unchanged ({len(recs)} recording(s)); no API requests, original files were not changed")
+
+
 def names(a):
     d = meeting(a.dir)
     t = json.loads((d / "transcript.json").read_text())
@@ -617,7 +670,11 @@ def share(a):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    if sys.argv[1:2] == ["names"]:
+    if sys.argv[1:2] == ["check"]:
+        p.add_argument("cmd", metavar="check")
+        p.add_argument("dir", help="the meeting's folder; joined recordings are checked together")
+        check(p.parse_args())
+    elif sys.argv[1:2] == ["names"]:
         p.add_argument("cmd", metavar="names")
         p.add_argument("dir")
         p.add_argument("pairs", nargs="+", metavar="N=Имя")
@@ -636,4 +693,5 @@ if __name__ == "__main__":
         p.add_argument("audio")
         p.add_argument("--name", help="slug for meetings/<date>-<slug>")
         p.add_argument("--terms", help="comma-separated names/terms for MAI's phrase list (first 50 used)")
+        p.add_argument("--cache-only", action="store_true", help="never call the API; fail if any chunk is missing (rebuilds the transcript)")
         run(p.parse_args())

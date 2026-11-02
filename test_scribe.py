@@ -37,6 +37,17 @@ def m4a(path, parts, **tags):
     return path
 
 
+def snapshot(d):
+    return {p.relative_to(d): p.read_bytes() for p in d.rglob("*") if p.is_file()}
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    def blocked(*args, **kwargs):
+        pytest.fail("Unexpected HTTP request: tests must use fake_api or cached responses")
+    monkeypatch.setattr(httpx, "post", blocked)
+
+
 # --- audio -------------------------------------------------------------------
 
 def test_scan_duration_and_long_silences(tmp_path):
@@ -326,6 +337,89 @@ def test_join_makes_one_transcript_and_reruns_never_pay(home, monkeypatch, capsy
     assert "--name ignored" in capsys.readouterr().err
     with pytest.raises(SystemExit, match="a part of a joined meeting"):
         scribe.join(argparse.Namespace(dir=str(d / "2"), parts=[str(d)]))
+
+
+def test_cache_only_needs_no_key_and_keeps_names(home, monkeypatch, capsys):
+    rec = wav(home / "rec.wav", [(12, 0.3)])
+    calls = []
+    monkeypatch.setattr(scribe.httpx, "post", fake_api({scribe.WORDS_MODEL: MAI, scribe.SPK_MODEL: SCRIBE}, calls))
+    scribe.run(argparse.Namespace(audio=str(rec), name="sync", terms=None))
+    d, = (home / "meetings").iterdir()
+    scribe.names(argparse.Namespace(dir=str(d), pairs=["1=Андрей"]))
+    capsys.readouterr()
+    monkeypatch.setattr(scribe, "api_key", lambda: pytest.fail("cache-only must not read an API key"))
+    scribe.run(argparse.Namespace(audio=str(rec), name="renamed", terms=None, cache_only=True))
+    renamed, = (home / "meetings").iterdir()
+    assert renamed.name.endswith("-renamed") and not d.exists()
+    assert "Андрей" in (renamed / "transcript.md").read_text() and len(calls) == 2
+    assert "$0.00 this run" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("missing", ["words_0-12.json", "speakers_0-12.json", "changed-plan"])
+def test_cache_only_missing_chunk_never_requests_or_changes_files(home, monkeypatch, missing):
+    rec = wav(home / "rec.wav", [(12, 0.3)])
+    calls = []
+    monkeypatch.setattr(scribe.httpx, "post", fake_api({scribe.WORDS_MODEL: MAI, scribe.SPK_MODEL: SCRIBE}, calls))
+    scribe.run(argparse.Namespace(audio=str(rec), name="sync", terms=None))
+    d, = (home / "meetings").iterdir()
+    if missing == "changed-plan":
+        monkeypatch.setattr(scribe, "plan", lambda *args: [(0, 6), (6, 12)])
+    else:
+        (d / "raw" / missing).unlink()
+    before = snapshot(d)
+    monkeypatch.setattr(scribe, "api_key", lambda: pytest.fail("cache-only must not read an API key"))
+    with pytest.raises(SystemExit, match="--cache-only: missing cached response"):
+        scribe.run(argparse.Namespace(audio=str(rec), name="renamed", terms=None, cache_only=True))
+    assert len(calls) == 2 and snapshot(d) == before and not (d / "work").exists()
+    assert list((home / "meetings").iterdir()) == [d]  # even the requested rename must not happen
+
+
+def test_cache_only_without_cache_creates_nothing(home, monkeypatch):
+    rec = wav(home / "rec.wav", [(12, 0.3)])
+    monkeypatch.setattr(scribe, "api_key", lambda: pytest.fail("cache-only must not read an API key"))
+    with pytest.raises(SystemExit, match="--cache-only: missing cached response"):
+        scribe.run(argparse.Namespace(audio=str(rec), name=None, terms=None, cache_only=True))
+    assert not (home / "meetings").exists()
+
+
+def test_check_joined_meeting_preserves_originals_and_reports_manual_edits(home, monkeypatch, capsys):
+    one, two = wav(home / "one.wav", [(12, 0.3)]), wav(home / "two.wav", [(12, 0.3)])
+    calls = []
+    monkeypatch.setattr(scribe.httpx, "post", fake_api({scribe.WORDS_MODEL: MAI, scribe.SPK_MODEL: SCRIBE}, calls))
+    for rec, name in ((one, "sync"), (two, "sync-2")):
+        scribe.run(argparse.Namespace(audio=str(rec), name=name, terms=None))
+    d, d2 = sorted((home / "meetings").iterdir())
+    scribe.join(argparse.Namespace(dir=str(d), parts=[str(d2)]))
+    scribe.names(argparse.Namespace(dir=str(d / "2"), pairs=["1=Андрей"]))
+    (d / "note.md").write_text("**До записи:** начало не записано.")
+    (d / "followup.md").write_text("Итоги для участников.")
+    scribe.render(d)
+    monkeypatch.setattr(scribe, "api_key", lambda: pytest.fail("check must not read an API key"))
+    before = snapshot(d)
+    scribe.check(argparse.Namespace(dir=str(d / "2")))  # a part checks the whole joined meeting
+    assert "check: unchanged (2 recording(s))" in capsys.readouterr().out
+    assert len(calls) == 4 and snapshot(d) == before
+    t = json.loads((d / "2" / "transcript.json").read_text())
+    t["utterances"][0]["text"] = "Исправлено вручную."
+    (d / "2" / "transcript.json").write_text(json.dumps(t, ensure_ascii=False))
+    scribe.render(d)
+    before = snapshot(d)
+    with pytest.raises(SystemExit, match=r"2/transcript.json \(utterances\).*transcript.md"):
+        scribe.check(argparse.Namespace(dir=str(d)))
+    assert len(calls) == 4 and snapshot(d) == before
+
+
+def test_check_missing_cache_preserves_originals(home, monkeypatch):
+    rec = wav(home / "rec.wav", [(12, 0.3)])
+    calls = []
+    monkeypatch.setattr(scribe.httpx, "post", fake_api({scribe.WORDS_MODEL: MAI, scribe.SPK_MODEL: SCRIBE}, calls))
+    scribe.run(argparse.Namespace(audio=str(rec), name="sync", terms=None))
+    d, = (home / "meetings").iterdir()
+    (d / "raw" / "words_0-12.json").unlink()
+    before = snapshot(d)
+    with pytest.raises(SystemExit, match="--cache-only: missing cached response"):
+        scribe.check(argparse.Namespace(dir=str(d)))
+    assert len(calls) == 2 and snapshot(d) == before
 
 
 def test_run_falls_back_to_scribe_words_when_mai_fails(home, monkeypatch, capsys):
