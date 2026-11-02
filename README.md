@@ -106,7 +106,7 @@ Gemini 3.1 Pro по словам почти не уступает MAI, но да
 ```
 scribe.py       аудио → transcript.md; один файл, зависимости ставит uv
 test_scribe.py  тесты без сети и без затрат: uv run test_scribe.py
-CLAUDE.md       порядок работы для Claude и шаблон фоллоу-апа
+AGENTS.md       порядок работы для AI-агента и шаблон фоллоу-апа
 glossary.txt    постоянные имена и термины, по строке; не попадает в git
 meetings/       результаты, не попадают в git
 ```
